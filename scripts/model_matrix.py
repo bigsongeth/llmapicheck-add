@@ -10,12 +10,24 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
+
+
+def detect_default_config() -> str:
+    candidates = [
+        os.environ.get("OPENCLAW_CONFIG", ""),
+        os.path.expanduser("~/.openclaw/openclaw.json"),
+        os.path.expanduser("~/.config/openclaw/openclaw.json"),
+        "/etc/openclaw/openclaw.json",
+        "/root/.openclaw/openclaw.json",
+    ]
+    for p in candidates:
+        if p and os.path.isfile(p):
+            return p
+    return os.path.expanduser("~/.openclaw/openclaw.json")
 
 
 def _resolve_env(value: Any) -> Any:
@@ -60,17 +72,57 @@ def _http_json(
         return 0, str(e), (time.perf_counter() - started) * 1000
 
 
+def _classify_probe_result(ok: bool, code: int, body: str, api_mode: str) -> Tuple[str, str]:
+    note = (body or "").strip().replace("\n", " ")[:180]
+    low = note.lower()
+
+    if ok:
+        try:
+            payload_json = json.loads(body)
+        except Exception as e:  # noqa: BLE001
+            return "non_json_response", f"non-json response: {str(e)[:60]} | {note}"
+
+        if isinstance(payload_json, dict) and payload_json.get("error") is not None:
+            return "runtime_error_payload", note
+
+        if api_mode == "openai-completions":
+            choices = payload_json.get("choices") if isinstance(payload_json, dict) else None
+            if not isinstance(choices, list) or not choices:
+                # common symptom: model is listed in /models but upstream payload shape is incompatible
+                if "status_code" in low or "status_msg" in low or "login fail" in low:
+                    return "advertised_but_unusable", f"advertised in /models but runtime payload incompatible | {note}"
+                return "incompatible_runtime_json", f"unexpected json (no choices) | {note}"
+        elif api_mode == "anthropic-messages":
+            content = payload_json.get("content") if isinstance(payload_json, dict) else None
+            if not isinstance(content, list) or not content:
+                return "incompatible_runtime_json", f"unexpected json (no content) | {note}"
+
+        return "ok", note
+
+    if code in (401, 403):
+        return "auth_error", note
+    if code == 429:
+        return "rate_limited", note
+    if code == 404:
+        return "endpoint_not_found", note
+    if code == 0:
+        return "network_error", note
+    if any(x in low for x in ["timed out", "timeout", "temporarily unavailable", "connection reset", "name or service not known"]):
+        return "network_error", note
+    return "http_error", note
+
+
 def _probe_openai(
     base_url: str,
     api_key: Optional[str],
     model_id: str,
     provider_headers: Dict[str, Any],
     timeout: float,
-) -> Tuple[bool, int, float, str]:
+) -> Tuple[bool, int, float, str, str]:
     endpoint = _join_endpoint(base_url, "openai-completions")
     headers: Dict[str, str] = {
         "Content-Type": "application/json",
-        "User-Agent": "curl/8.5.0",
+        "User-Agent": "openclaw-model-ops/0.3",
     }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -85,23 +137,9 @@ def _probe_openai(
         "stream": False,
     }
     code, body, ms = _http_json(endpoint, payload, headers, timeout)
-
     ok = 200 <= code < 300
-    note = (body or "").strip().replace("\n", " ")[:120]
-    if ok:
-        try:
-            payload_json = json.loads(body)
-        except Exception as e:  # noqa: BLE001
-            return False, code, ms, f"non-json response: {str(e)[:60]} | {note}"
-
-        if isinstance(payload_json, dict) and payload_json.get("error") is not None:
-            return False, code, ms, note
-
-        choices = payload_json.get("choices") if isinstance(payload_json, dict) else None
-        if not isinstance(choices, list) or not choices:
-            return False, code, ms, f"unexpected json (no choices) | {note}"
-
-    return ok, code, ms, note
+    status, note = _classify_probe_result(ok, code, body, "openai-completions")
+    return status == "ok", code, ms, note, status
 
 
 def _probe_anthropic(
@@ -110,12 +148,12 @@ def _probe_anthropic(
     model_id: str,
     provider_headers: Dict[str, Any],
     timeout: float,
-) -> Tuple[bool, int, float, str]:
+) -> Tuple[bool, int, float, str, str]:
     endpoint = _join_endpoint(base_url, "anthropic-messages")
     headers: Dict[str, str] = {
         "Content-Type": "application/json",
         "anthropic-version": "2023-06-01",
-        "User-Agent": "curl/8.5.0",
+        "User-Agent": "openclaw-model-ops/0.3",
     }
     if api_key:
         headers["x-api-key"] = api_key
@@ -129,32 +167,22 @@ def _probe_anthropic(
         "messages": [{"role": "user", "content": "healthcheck ping"}],
     }
     code, body, ms = _http_json(endpoint, payload, headers, timeout)
-
     ok = 200 <= code < 300
-    note = (body or "").strip().replace("\n", " ")[:120]
-    if ok:
-        try:
-            payload_json = json.loads(body)
-        except Exception as e:  # noqa: BLE001
-            return False, code, ms, f"non-json response: {str(e)[:60]} | {note}"
-
-        if isinstance(payload_json, dict) and payload_json.get("error") is not None:
-            return False, code, ms, note
-
-        content = payload_json.get("content") if isinstance(payload_json, dict) else None
-        if not isinstance(content, list) or not content:
-            return False, code, ms, f"unexpected json (no content) | {note}"
-
-    return ok, code, ms, note
+    status, note = _classify_probe_result(ok, code, body, "anthropic-messages")
+    return status == "ok", code, ms, note, status
 
 
-def _status_icon(ok: bool, code: int) -> str:
+def _status_icon(kind: str, ok: bool, code: int) -> str:
     if ok:
         return "✅"
-    if code == 401 or code == 403:
+    if kind == "auth_error" or code in (401, 403):
         return "🔒"
-    if code == 0:
+    if kind == "network_error" or code == 0:
         return "🌐"
+    if kind == "rate_limited":
+        return "⏳"
+    if kind == "advertised_but_unusable":
+        return "⚠️"
     return "❌"
 
 
@@ -194,7 +222,7 @@ def _build_agent_summary(cfg: Dict[str, Any]) -> List[Dict[str, str]]:
 
 def run() -> int:
     p = argparse.ArgumentParser(description="OpenClaw model availability matrix")
-    p.add_argument("--config", default="/root/.openclaw/openclaw.json")
+    p.add_argument("--config", default=detect_default_config())
     p.add_argument("--timeout", type=float, default=20.0)
     p.add_argument("--providers", default="", help="Comma-separated provider ids")
     p.add_argument("--output", default="", help="Write markdown report to file")
@@ -225,6 +253,7 @@ def run() -> int:
                     "model": "(none)",
                     "api": api_mode,
                     "ok": False,
+                    "kind": "no_models",
                     "code": 0,
                     "latency_ms": 0.0,
                     "note": "no models configured",
@@ -238,11 +267,11 @@ def run() -> int:
                 continue
 
             if api_mode == "openai-completions":
-                ok, code, ms, note = _probe_openai(base_url, api_key, mid, headers, args.timeout)
+                ok, code, ms, note, kind = _probe_openai(base_url, api_key, mid, headers, args.timeout)
             elif api_mode == "anthropic-messages":
-                ok, code, ms, note = _probe_anthropic(base_url, api_key, mid, headers, args.timeout)
+                ok, code, ms, note, kind = _probe_anthropic(base_url, api_key, mid, headers, args.timeout)
             else:
-                ok, code, ms, note = False, 0, 0.0, f"unsupported api mode: {api_mode}"
+                ok, code, ms, note, kind = False, 0, 0.0, f"unsupported api mode: {api_mode}", "unsupported_api_mode"
 
             rows.append(
                 {
@@ -250,6 +279,7 @@ def run() -> int:
                     "model": mid,
                     "api": api_mode,
                     "ok": ok,
+                    "kind": kind,
                     "code": code,
                     "latency_ms": round(ms, 1),
                     "note": note,
@@ -261,18 +291,18 @@ def run() -> int:
     now = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
     md_lines: List[str] = []
-    md_lines.append(f"# 📊 OpenClaw 模型可用性矩阵")
+    md_lines.append("# 📊 OpenClaw 模型可用性矩阵")
     md_lines.append("")
     md_lines.append(f"- 检测时间: `{now}`")
     md_lines.append(f"- 总计: `{ok_count}/{total}` 可用")
     md_lines.append("")
-    md_lines.append("| Provider | Model | API | 状态 | HTTP | RTT(ms) | 备注 |")
-    md_lines.append("|---|---|---|---:|---:|---:|---|")
+    md_lines.append("| Provider | Model | API | 状态 | 分类 | HTTP | RTT(ms) | 备注 |")
+    md_lines.append("|---|---|---|---:|---|---:|---:|---|")
     for r in rows:
-        icon = _status_icon(bool(r["ok"]), int(r["code"]))
+        icon = _status_icon(str(r.get("kind", "")), bool(r["ok"]), int(r["code"]))
         note = str(r["note"]).replace("|", "\\|")
         md_lines.append(
-            f"| {r['provider']} | {r['model']} | {r['api']} | {icon} | {r['code']} | {r['latency_ms']} | {note} |"
+            f"| {r['provider']} | {r['model']} | {r['api']} | {icon} | {r.get('kind','')} | {r['code']} | {r['latency_ms']} | {note} |"
         )
 
     md_lines.append("")

@@ -17,6 +17,12 @@ The core workflow is API-first:
 - Fuzzy resolve user-input model names via `/v1/models`
 - Auto-fill static metadata (`contextWindow`, `maxTokens`, `cost`, `modalities`, `reasoning`) from `models.dev/api.json`
 - Optionally probe the provider immediately after add/update
+- Classify probe failures into more readable buckets such as:
+  - `auth_error`
+  - `network_error`
+  - `rate_limited`
+  - `incompatible_runtime_json`
+  - `advertised_but_unusable`
 
 ## Files
 
@@ -44,6 +50,17 @@ This skill separates the job into three layers:
 - `check` / probe → actual runtime compatibility
 
 That makes it safer for OpenAI-compatible proxy gateways and other multi-model routers.
+
+## Default config path behavior
+
+The scripts no longer assume `/root/.openclaw/openclaw.json`.
+They detect config in this order:
+
+1. `OPENCLAW_CONFIG`
+2. `~/.openclaw/openclaw.json`
+3. `~/.config/openclaw/openclaw.json`
+4. `/etc/openclaw/openclaw.json`
+5. `/root/.openclaw/openclaw.json`
 
 ## License
 
