@@ -9,6 +9,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -31,14 +32,15 @@ def detect_default_config() -> str:
     for p in candidates:
         if p and os.path.isfile(p):
             return p
-    # best effort default for user installs
     return os.path.expanduser("~/.openclaw/openclaw.json")
 
 
 DEFAULT_CONFIG = detect_default_config()
 
 
-def run_cmd(args: List[str]) -> int:
+def run_cmd(args: List[str], capture: bool = False) -> subprocess.CompletedProcess[str] | int:
+    if capture:
+        return subprocess.run(args, text=True, capture_output=True)
     proc = subprocess.run(args)
     return int(proc.returncode)
 
@@ -68,6 +70,7 @@ def main() -> int:
     p_add.add_argument("--timeout", type=float, default=15.0)
     p_add.add_argument("--models-dev-url", default="https://models.dev/api.json")
     p_add.add_argument("--no-models-dev", action="store_true")
+    p_add.add_argument("--probe-after-add", action="store_true", help="run availability check for the provider immediately after add/update")
 
     args = p.parse_args()
 
@@ -86,7 +89,7 @@ def main() -> int:
             cmd += ["--output", args.output]
         if args.json_output:
             cmd += ["--json", args.json_output]
-        return run_cmd(cmd)
+        return run_cmd(cmd)  # type: ignore[return-value]
 
     if args.cmd == "add":
         cmd = [
@@ -119,7 +122,42 @@ def main() -> int:
             cmd += ["--no-fuzzy"]
         if args.no_models_dev:
             cmd += ["--no-models-dev"]
-        return run_cmd(cmd)
+
+        if not args.probe_after_add:
+            return run_cmd(cmd)  # type: ignore[return-value]
+
+        add_proc = run_cmd(cmd, capture=True)
+        assert isinstance(add_proc, subprocess.CompletedProcess)
+        if add_proc.stdout:
+            print(add_proc.stdout.strip())
+        if add_proc.returncode != 0:
+            if add_proc.stderr:
+                print(add_proc.stderr.strip(), file=sys.stderr)
+            return int(add_proc.returncode)
+
+        provider = args.provider
+        if not provider:
+            try:
+                payload = json.loads(add_proc.stdout.strip())
+                provider = payload.get("provider", "")
+            except Exception:
+                provider = ""
+        if not provider:
+            print("warning: provider id unknown, skip probe-after-add", file=sys.stderr)
+            return 0
+
+        print(f"\n# probe-after-add: {provider}\n")
+        check_cmd = [
+            sys.executable,
+            MODEL_MATRIX,
+            "--config",
+            args.config,
+            "--providers",
+            provider,
+            "--timeout",
+            str(min(args.timeout, 12.0)),
+        ]
+        return run_cmd(check_cmd)  # type: ignore[return-value]
 
     return 1
 
