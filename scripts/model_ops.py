@@ -18,7 +18,24 @@ from typing import List
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL_MATRIX = os.path.join(HERE, "model_matrix.py")
 ADD_PROVIDER = os.path.join(HERE, "add_provider.py")
-DEFAULT_CONFIG = "/root/.openclaw/openclaw.json"
+
+
+def detect_default_config() -> str:
+    candidates = [
+        os.environ.get("OPENCLAW_CONFIG", ""),
+        os.path.expanduser("~/.openclaw/openclaw.json"),
+        os.path.expanduser("~/.config/openclaw/openclaw.json"),
+        "/etc/openclaw/openclaw.json",
+        "/root/.openclaw/openclaw.json",
+    ]
+    for p in candidates:
+        if p and os.path.isfile(p):
+            return p
+    # best effort default for user installs
+    return os.path.expanduser("~/.openclaw/openclaw.json")
+
+
+DEFAULT_CONFIG = detect_default_config()
 
 
 def run_cmd(args: List[str]) -> int:
@@ -49,6 +66,8 @@ def main() -> int:
     p_add.add_argument("--from-message", default="")
     p_add.add_argument("--no-fuzzy", action="store_true")
     p_add.add_argument("--timeout", type=float, default=15.0)
+    p_add.add_argument("--models-dev-url", default="https://models.dev/api.json")
+    p_add.add_argument("--no-models-dev", action="store_true")
 
     args = p.parse_args()
 
@@ -79,6 +98,8 @@ def main() -> int:
             args.api_mode,
             "--timeout",
             str(args.timeout),
+            "--models-dev-url",
+            args.models_dev_url,
         ]
         if args.provider:
             cmd += ["--provider", args.provider]
@@ -96,6 +117,8 @@ def main() -> int:
             cmd += ["--set-primary"]
         if args.no_fuzzy:
             cmd += ["--no-fuzzy"]
+        if args.no_models_dev:
+            cmd += ["--no-models-dev"]
         return run_cmd(cmd)
 
     return 1
