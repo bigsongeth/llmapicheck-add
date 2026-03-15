@@ -1,66 +1,87 @@
-# openclaw-model-ops (opencode skill)
+# openclaw-model-ops（OpenClaw 模型运维技能）
 
-An opencode skill for OpenClaw model operations.
+一个面向 **OpenClaw** 的模型运维技能，适配 **有浏览器**与**无浏览器（browserless）**环境。
 
-It is designed for both normal desktop sessions **and browserless agents**.
-The core workflow is API-first:
+核心流程（API-first）：
+1. 调 provider 的 `/models` 获取真实模型 id
+2. 拉取 `https://models.dev/api.json` 补全静态参数
+3. 真实探活（probe）确认可用性
 
-1. query the provider's `/models` endpoint to get real model ids
-2. enrich metadata from `https://models.dev/api.json`
-3. run a real probe to confirm the model is actually callable
+---
 
-## What it does
+## 能做什么
 
-- Check provider/model availability matrix
-- Show agent primary/fallback model mapping
-- Add or update provider config from URL + API key (+ optional models)
-- Fuzzy resolve user-input model names via `/v1/models`
-- Auto-fill static metadata (`contextWindow`, `maxTokens`, `cost`, `modalities`, `reasoning`) from `models.dev/api.json`
-- Optionally probe the provider immediately after add/update
-- Classify probe failures into more readable buckets such as:
-  - `auth_error`
-  - `network_error`
-  - `rate_limited`
-  - `incompatible_runtime_json`
-  - `advertised_but_unusable`
+- 生成模型可用性矩阵（含 agent 主模型 / fallback）
+- 从 URL + API Key 自动写入 provider 配置
+- 模糊匹配用户输入模型名（如 `gpt54` → `gpt-5.4`）
+- 自动补齐模型 metadata（context / maxTokens / cost / modalities / reasoning）
+- 支持 `--probe-after-add`：添加后立刻验活
+- 探活结果自动分类（更像产品输出而不是原始错误堆栈）
 
-## Files
+---
 
-- `SKILL.md`: skill definition and workflow
-- `scripts/model_ops.py`: unified CLI (`check` and `add`)
-- `scripts/model_matrix.py`: model availability probing/reporting
-- `scripts/add_provider.py`: provider upsert + fuzzy model mapping + models.dev enrichment
-- `references/notes.md`: operational notes
-
-## Quick Start
+## 快速使用
 
 ```bash
+# 探活（全量）
 python3 scripts/model_ops.py check --timeout 12
+
+# 从用户消息添加 provider
 python3 scripts/model_ops.py add --from-message "https://example.com sk-xxx gpt54 glm5"
+
+# 添加后立刻 probe
 python3 scripts/model_ops.py add --from-message "https://example.com sk-xxx gpt54 glm5" --probe-after-add
 ```
 
-## Why this is useful
+---
 
-A model appearing in `/v1/models` does **not** guarantee it is actually usable.
-This skill separates the job into three layers:
+## 探活结果分类（Scale / Legend）
 
-- `/models` → exact ids
-- `models.dev/api.json` → static metadata
-- `check` / probe → actual runtime compatibility
+| 图标 | 分类 | 含义 | 建议动作 |
+|---|---|---|---|
+| ✅ | `ok` | 正常可用 | 可作为 primary / fallback |
+| 🔒 | `auth_error` | 鉴权失败（401/403） | 检查 API Key / 权限 |
+| 🌐 | `network_error` | 网络异常 | 检查网络 / 重试 |
+| ⏳ | `rate_limited` | 被限流 | 等待 `retry_after` 或降频 |
+| ⚠️ | `advertised_but_unusable` | `/models` 有，但运行时结构不兼容 | 不要作为默认候选 |
+| ❌ | `http_error` / `incompatible_runtime_json` | 其他错误 | 视情况降权或移除 |
 
-That makes it safer for OpenAI-compatible proxy gateways and other multi-model routers.
+---
 
-## Default config path behavior
+## 为什么这套流程重要？
 
-The scripts no longer assume `/root/.openclaw/openclaw.json`.
-They detect config in this order:
+`/v1/models` 里出现的模型 **不一定真的能用**。
+这套技能把问题拆成三层：
+
+- `/models` → 模型 **id 是否真实存在**
+- `models.dev/api.json` → **静态参数** 是否准确
+- probe → **运行时兼容性** 是否可信
+
+这套流程非常适合多模型路由器 / OpenAI-compatible gateway / browserless agent。
+
+---
+
+## 默认配置路径规则
+
+脚本不再写死 `/root/.openclaw/openclaw.json`，而是按以下顺序探测：
 
 1. `OPENCLAW_CONFIG`
 2. `~/.openclaw/openclaw.json`
 3. `~/.config/openclaw/openclaw.json`
 4. `/etc/openclaw/openclaw.json`
 5. `/root/.openclaw/openclaw.json`
+
+---
+
+## 文件结构
+
+- `SKILL.md`：技能说明与流程
+- `scripts/model_ops.py`：统一入口（check + add）
+- `scripts/model_matrix.py`：探活矩阵逻辑
+- `scripts/add_provider.py`：写入 provider + 模糊匹配 + metadata 补全
+- `references/notes.md`：运维注意事项
+
+---
 
 ## License
 
